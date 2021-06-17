@@ -1,4 +1,4 @@
-// Core Raft implementation - Consensus Module.
+// Package raft Core Raft implementation - Consensus Module.
 //
 // Eli Bendersky [https://eli.thegreenplace.net]
 // This code is in the public domain.
@@ -46,14 +46,18 @@ func (s CMState) String() string {
 }
 
 // ConsensusModule (CM) implements a single node of Raft consensus.
+// ConsensusModule 实现了一个节点的 Raft 共识算法
 type ConsensusModule struct {
 	// mu protects concurrent access to a CM.
+	// mu 防止CM的并发
 	mu sync.Mutex
 
 	// id is the server ID of this CM.
+	// 这个 module 的服务 id
 	id int
 
 	// peerIds lists the IDs of our peers in the cluster.
+	// 整个集群其他节点的id集合
 	peerIds []int
 
 	// server is the server containing this CM. It's used to issue RPC calls
@@ -119,7 +123,7 @@ func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	}
 }
 
-// See figure 2 in the paper.
+// RequestVoteArgs See figure 2 in the paper.
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -133,6 +137,7 @@ type RequestVoteReply struct {
 }
 
 // RequestVote RPC.
+// 对于 RequestVote 请求的响应
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -140,13 +145,14 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		return nil
 	}
 	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
-
+	// 如果发来投票请求的term大 直接变成follower
 	if args.Term > cm.currentTerm {
 		cm.dlog("... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
 
 	if cm.currentTerm == args.Term &&
+		//-1 代表没投票且不投自己(自己不是候选者)
 		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateId
@@ -159,7 +165,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	return nil
 }
 
-// See figure 2 in the paper.
+// AppendEntriesArgs See figure 2 in the paper.
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
@@ -175,6 +181,8 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// AppendEntries 当节点状态为leader时使用
+// 用来复制 LogEntry 给 followers 或者用来发送心跳
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -203,6 +211,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 }
 
 // electionTimeout generates a pseudo-random election timeout duration.
+// electionTimeout 方法用来生成随机的超时时间 150~300ms
 func (cm *ConsensusModule) electionTimeout() time.Duration {
 	// If RAFT_FORCE_MORE_REELECTION is set, stress-test by deliberately
 	// generating a hard-coded number very often. This will create collisions
@@ -220,6 +229,8 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 // This function is blocking and should be launched in a separate goroutine;
 // it's designed to work for a single (one-shot) election timer, as it exits
 // whenever the CM state changes from follower/candidate or the term changes.
+// 运行选举计时器 goroutine 中 for 循环一直运行
+// 通过一个goroutine 来跑这个函数
 func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
@@ -232,6 +243,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	// - the election timer expires and this CM becomes a candidate
 	// In a follower, this typically keeps running in the background for the
 	// duration of the CM's lifetime.
+	// 让循环每10ms执行一次
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -239,11 +251,14 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 		cm.mu.Lock()
 		if cm.state != Candidate && cm.state != Follower {
+			//不是 candidate 或者 follower 只能是 leader 或者节点已经挂了
 			cm.dlog("in election timer state=%s, bailing out", cm.state)
 			cm.mu.Unlock()
 			return
 		}
 
+		// 如果节点当前的任期不是节点当前的任期,退出
+		// 也就是说这期间可能其他节点当选的leader, 需要重新记时
 		if termStarted != cm.currentTerm {
 			cm.dlog("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
 			cm.mu.Unlock()
@@ -252,6 +267,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 		// Start an election if we haven't heard from a leader or haven't voted for
 		// someone for the duration of the timeout.
+		// 如果接受消息超时 就会发起开始选举
 		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
 			cm.startElection()
 			cm.mu.Unlock()
@@ -263,6 +279,11 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 // startElection starts a new election with this CM as a candidate.
 // Expects cm.mu to be locked.
+// startElection 实现节点选举的函数
+// 在这个函数内
+// 1. 将自身状态由追随者转变为候选者
+// 2. 向所有的 peers 发送 RequestVote 请求,请他们给自己在这一轮选举中投票
+// 3. 等待RPC响应 检查票数看自己是否能够当选
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
@@ -292,7 +313,8 @@ func (cm *ConsensusModule) startElection() {
 					cm.dlog("while waiting for reply, state = %v", cm.state)
 					return
 				}
-
+				// 应答返回的 term 比自己要求投票的任期大,说明已经有其他节点当选 leader
+				// 退出选举并转变为 Follower
 				if reply.Term > savedCurrentTerm {
 					cm.dlog("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
@@ -313,11 +335,13 @@ func (cm *ConsensusModule) startElection() {
 	}
 
 	// Run another election timer, in case this election is not successful.
+	// 重新启用计时器,等待响应超时了也会重新进入 这个函数(startElection)
 	go cm.runElectionTimer()
 }
 
 // becomeFollower makes cm a follower and resets its state.
 // Expects cm.mu to be locked.
+// ☝️上面的应该改为 becomeFollowerLocked
 func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
@@ -330,11 +354,14 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 
 // startLeader switches cm into a leader state and begins process of heartbeats.
 // Expects cm.mu to be locked.
+// 进入这个方法一定是上了锁为前提的
+// 按照 golang 命名规范应该命名为 startLeaderLocked
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
 	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
 
 	go func() {
+		// 每隔 50ms 给 Follower 发送心跳包
 		ticker := time.NewTicker(50 * time.Millisecond)
 		defer ticker.Stop()
 

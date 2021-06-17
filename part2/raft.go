@@ -1,4 +1,4 @@
-// Core Raft implementation - Consensus Module.
+// Package raft Core Raft implementation - Consensus Module.
 //
 // Eli Bendersky [https://eli.thegreenplace.net]
 // This code is in the public domain.
@@ -76,11 +76,13 @@ type ConsensusModule struct {
 
 	// commitChan is the channel where this CM is going to report committed log
 	// entries. It's passed in by the client during construction.
+	// commitChan 用来向调用方 (Caller) 返回已经被 commit 的指令
 	commitChan chan<- CommitEntry
 
 	// newCommitReadyChan is an internal notification channel used by goroutines
 	// that commit new entries to the log to notify that these entries may be sent
 	// on commitChan.
+	// newCommitReadyChan 是用来做通知管道的,通知 新的日志条目可以被送进 commitChan 持久化到状态机
 	newCommitReadyChan chan struct{}
 
 	// Persistent Raft state on all servers
@@ -89,14 +91,25 @@ type ConsensusModule struct {
 	log         []LogEntry
 
 	// Volatile Raft state on all servers
+	// commitIndex 会根据成功复制指令的 follower 数目来更新，如果一个 log entry 被成功复制到多数派节点，
+	//则将 commitIndex 更新为该 entry 的 index
 	commitIndex        int
 	lastApplied        int
 	state              CMState
 	electionResetEvent time.Time
 
 	// Volatile Raft state on leaders
-	nextIndex  map[int]int
+	// nextIndex 维护这 Followers 的 nextIndex 信息
+	// 也就是记录了每一个 Follower 的下一个写入日志的位置
+	nextIndex map[int]int
+	// matchIndex 记录了每一个follower 与leader 完全匹配的日志的最后位置
+	// 如果 超过半数的话就视为成功
 	matchIndex map[int]int
+	// NextIndex 和 MatchIndex 的区别
+	//
+	// NextIndex 记录可能的下一个 Log 序号，意味着可能不正确，比如新的主节点被选出来以后，会假设所有的从节点的数据最新，
+	// 然后如果发RPC或者失败回复，才会确认该节点有部分数据未同步
+	// MatchIndex记录的是已经确认过该从节点已经获得的数据
 }
 
 // NewConsensusModule creates a new CM with the given ID, list of peer IDs and
@@ -140,9 +153,11 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 
 // Submit submits a new command to the CM. This function doesn't block; clients
 // read the commit channel passed in the constructor to be notified of new
-// committed entries. It returns true iff this CM is the leader - in which case
+// committed entries. It returns true if this CM is the leader - in which case
 // the command is accepted. If false is returned, the client will have to find
 // a different CM to submit this command to.
+// Submit 只对 leader 有效 如果是 leader 的话会向调用方返回 True, 同时将 Command 写入自己的日志中
+// 否则返回 False, 那么调用方不得不从新选择一个节点(Leader)来发送 Log
 func (cm *ConsensusModule) Submit(command interface{}) bool {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -175,7 +190,7 @@ func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	}
 }
 
-// See figure 2 in the paper.
+// RequestVoteArgs See figure 2 in the paper.
 type RequestVoteArgs struct {
 	Term         int
 	CandidateId  int
@@ -196,7 +211,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		return nil
 	}
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]",
+		args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
 
 	if args.Term > cm.currentTerm {
 		cm.dlog("... term out of date in RequestVote")
@@ -218,20 +234,20 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	return nil
 }
 
-// See figure 2 in the paper.
+// AppendEntriesArgs See figure 2 in the paper.
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
 
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
+	PrevLogIndex int        //此前一条的日志索引
+	PrevLogTerm  int        //此前一条的任期号
+	Entries      []LogEntry // 日志实体
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term    int
-	Success bool
+	Success bool //Success 属性能告诉 Leader 能否匹配上 PrevLogIndex 和 PrevLogTerm
 }
 
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
@@ -241,7 +257,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		return nil
 	}
 	cm.dlog("AppendEntries: %+v", args)
-
+	// Leader 任期比自己当前任期大,就将自己的角色转变为 Follower
 	if args.Term > cm.currentTerm {
 		cm.dlog("... term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
@@ -258,19 +274,25 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		// PrevLogTerm? Note that in the extreme case of PrevLogIndex=-1 this is
 		// vacuously true.
 		if args.PrevLogIndex == -1 ||
+			// Leader给的的 preIndex < Follower 的日志长度 且 两人的 pre 的任期相同(还在同一个任期没有发生状态转变)
+			// 保证了前面的日志都是同步的 这是可以证明的
 			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
 			reply.Success = true
 
 			// Find an insertion point - where there's a term mismatch between
 			// the existing log starting at PrevLogIndex+1 and the new entries sent
 			// in the RPC.
+			// logInsertIndex 准备插入的位置
 			logInsertIndex := args.PrevLogIndex + 1
 			newEntriesIndex := 0
 
+			// 这个for是为了找到覆盖武无效日志的位置
 			for {
+				// 插入位置比本来的日志长度大 或者 没有需要写入的日志(纯纯的心跳包罢了)
 				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
 					break
 				}
+				// 当遇到任期不同的时候就需要进行覆盖了
 				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
 					break
 				}
@@ -282,6 +304,10 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			//   term mismatches with an entry from the leader
 			// - newEntriesIndex points at the end of Entries, or an index where the
 			//   term mismatches with the corresponding log entry
+			// 退出循环的情况:
+			// - logInsertIndex 位置在这个节点日志的末尾了, 或者这个位置的任期和 leader 日志的这个任期不匹配
+			// - 新日志的覆盖位置已经是新日志的末尾了 或者这个位置的任期和相应位置的任期没有匹配上
+
 			if newEntriesIndex < len(args.Entries) {
 				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
@@ -289,6 +315,9 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 
 			// Set commit index.
+			// 当 Follower 发现leader commitIndex 比自己的新的时候
+			// 直接将这些日志应用到自己的状态机
+			// 即向 newCommitReadyChannel 发送信号
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
 				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
@@ -443,7 +472,8 @@ func (cm *ConsensusModule) startLeader() {
 		cm.nextIndex[peerId] = len(cm.log)
 		cm.matchIndex[peerId] = -1
 	}
-	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
+	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v",
+		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
 
 	go func() {
 		ticker := time.NewTicker(50 * time.Millisecond)
@@ -480,6 +510,7 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			if prevLogIndex >= 0 {
 				prevLogTerm = cm.log[prevLogIndex].Term
 			}
+			// entries 需要追加的日志
 			entries := cm.log[ni:]
 
 			args := AppendEntriesArgs{
@@ -504,9 +535,11 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 
 				if cm.state == Leader && savedCurrentTerm == reply.Term {
 					if reply.Success {
+						// 如果Follower复制成功
 						cm.nextIndex[peerId] = ni + len(entries)
 						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
-						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, cm.nextIndex, cm.matchIndex)
+						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v",
+							peerId, cm.nextIndex, cm.matchIndex)
 
 						savedCommitIndex := cm.commitIndex
 						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
@@ -517,16 +550,21 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 										matchCount++
 									}
 								}
+								//超过一半的Followers都复制了,说明达到committed状态了
 								if matchCount*2 > len(cm.peerIds)+1 {
 									cm.commitIndex = i
 								}
 							}
 						}
+						// 说明新的日志已经被超过一半的节点复制了, 可以通知客户端写入成功了
 						if cm.commitIndex != savedCommitIndex {
 							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
+							// 通知 commitChanSender 这个 goroutine 可以持久化到状态机了
 							cm.newCommitReadyChan <- struct{}{}
 						}
 					} else {
+						//写入失败 说明不匹配,需要回退一格进行重新匹配
+						//下一个循环发送心跳的时候会 根据 cm.nextIndex[peerId] 进行重新发送
 						cm.nextIndex[peerId] = ni - 1
 						cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
 					}
@@ -567,7 +605,7 @@ func (cm *ConsensusModule) commitChanSender() {
 		}
 		cm.mu.Unlock()
 		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
-
+		// 将新的可以提交到状态机的日志条目发往状态机 Channel
 		for i, entry := range entries {
 			cm.commitChan <- CommitEntry{
 				Command: entry.Command,
