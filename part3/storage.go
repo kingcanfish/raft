@@ -1,4 +1,4 @@
-// Eli Bendersky [https://eli.thegreenplace.net]
+// Package raft Eli Bendersky [https://eli.thegreenplace.net]
 // This code is in the public domain.
 package raft
 
