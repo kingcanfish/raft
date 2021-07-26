@@ -605,7 +605,7 @@ func (cm *ConsensusModule) commitChanSender() {
 		}
 		cm.mu.Unlock()
 		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
-		// 将新的可以提交到状态机的日志条目发往状态机 Channel
+		// 将新的可以提交到状态机的日志条目发往自己节点状态机 Channel
 		for i, entry := range entries {
 			cm.commitChan <- CommitEntry{
 				Command: entry.Command,

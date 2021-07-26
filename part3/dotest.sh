@@ -4,6 +4,7 @@ set -e
 
 logfile=~/temp/rlog
 
-go test -v -race -run $@ |& tee ${logfile}
+# shellcheck disable=SC2068
+go test -v -race -run  $@ |& tee ${logfile}
 
 go run ../tools/raft-testlog-viz/main.go < ${logfile}
